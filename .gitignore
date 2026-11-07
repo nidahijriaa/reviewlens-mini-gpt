@@ -1,0 +1,22 @@
+
+# Dataset and processed data
+/data/
+
+# Model checkpoints
+/checkpoints/
+*.pt
+*.pth
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment secrets
+.env
+
+# Jupyter temporary files
+.ipynb_checkpoints/
