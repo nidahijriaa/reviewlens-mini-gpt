@@ -6,7 +6,10 @@ Contract: INTERFACES.md section 4.
   memory only. The source file is never written.
 - ``clean_text`` is the single cleaning function for training, labeling, and
   inference. Negation normalisation happens here and nowhere else.
-- ``split_data`` performs a deterministic stratified split on ``sentiment``.
+- ``split_data`` performs a deterministic stratified split on ``sentiment``,
+  grouped by ``clean_text(review)`` so identical reviews never cross splits;
+  groups with conflicting sentiment labels are dropped
+  (``split_data_with_stats`` also returns the statistics).
 """
 
 from __future__ import annotations
@@ -184,48 +187,123 @@ def load_reviews(csv_path: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
+_SPLIT_NAMES = ("train", "val", "test")
+_MISSING_SENTIMENT = "<NA>"
+_MAX_CONFLICT_EXAMPLES = 10
+
+
 def split_data(
     df: pd.DataFrame,
     val_frac: float = 0.1,
     test_frac: float = 0.1,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Deterministic stratified split on ``sentiment`` into train/val/test.
+    """Deterministic, leakage-free stratified split into train/val/test.
 
-    Each sentiment class is shuffled with a seeded RNG and split by the given
-    fractions, so class proportions are preserved in every split. Missing
-    sentiment values form their own stratum (no rows are lost). Splits are
-    disjoint and together contain every input row.
+    Same behaviour as ``split_data_with_stats`` without the statistics.
     """
-    if "sentiment" not in df.columns:
-        raise ValueError("split_data membutuhkan kolom 'sentiment'")
+    train, val, test, _ = split_data_with_stats(df, val_frac, test_frac, seed)
+    return train, val, test
+
+
+def split_data_with_stats(
+    df: pd.DataFrame,
+    val_frac: float = 0.1,
+    test_frac: float = 0.1,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    """Group-aware stratified split that keeps identical reviews in one split.
+
+    1. Rows are grouped by ``clean_text(review)``, so texts that differ only in
+       case, punctuation, slang or stretched letters form one group.
+    2. **Conflict groups** (more than one distinct ``sentiment``; a missing
+       sentiment counts as its own value) are dropped entirely. Labels are
+       never changed.
+    3. Every remaining group (one sentiment, possibly many rows) goes to exactly
+       one split. Stratification is per sentiment: inside each stratum, groups
+       are placed largest first (equal sizes in seeded random order) into the
+       split currently furthest below its row target (``round(n * frac)``).
+       With only single-row groups the per-class counts are exactly the
+       targets; large groups may make proportions approximate.
+    4. Rows inside each split are shuffled with the same seed. Deterministic
+       for a given input and ``seed``. Input columns and values are unchanged.
+
+    Returns ``(train, val, test, stats)``; ``stats`` holds the number of
+    groups, conflict groups, dropped/kept rows and per-split rows/groups.
+    """
+    for col in ("review", "sentiment"):
+        if col not in df.columns:
+            raise ValueError(f"split_data membutuhkan kolom '{col}'")
     if not (0 <= val_frac < 1 and 0 <= test_frac < 1 and val_frac + test_frac < 1):
         raise ValueError(
             f"Fraksi tidak valid: val_frac={val_frac}, test_frac={test_frac}"
         )
 
     rng = np.random.default_rng(seed)
-    strata = df["sentiment"].astype(object).where(df["sentiment"].notna(), "<NA>")
-    strata = strata.astype(str)
+    keys = df["review"].map(clean_text).to_numpy(dtype=object)
+    labels = (
+        df["sentiment"].astype(object)
+        .where(df["sentiment"].notna(), _MISSING_SENTIMENT)
+        .astype(str).to_numpy(dtype=object)
+    )
 
-    train_pos: list[np.ndarray] = []
-    val_pos: list[np.ndarray] = []
-    test_pos: list[np.ndarray] = []
-    # Sorted class order + positional indices -> deterministic for a given seed.
-    for label in sorted(strata.unique()):
-        pos = np.flatnonzero((strata == label).to_numpy())
-        pos = rng.permutation(pos)
-        n = len(pos)
+    # key -> row positions, and key -> set of sentiments.
+    group_pos: dict[str, list[int]] = {}
+    group_labels: dict[str, set[str]] = {}
+    for pos, (key, label) in enumerate(zip(keys, labels)):
+        group_pos.setdefault(key, []).append(pos)
+        group_labels.setdefault(key, set()).add(label)
+
+    conflict_keys = sorted(k for k, s in group_labels.items() if len(s) > 1)
+    conflict_set = set(conflict_keys)
+    n_dropped = sum(len(group_pos[k]) for k in conflict_keys)
+
+    # stratum (sentiment) -> list of (key, positions)
+    strata: dict[str, list[tuple[str, list[int]]]] = {}
+    for key in sorted(group_pos):          # sorted -> independent of row order
+        if key in conflict_set:
+            continue
+        (label,) = group_labels[key]
+        strata.setdefault(label, []).append((key, group_pos[key]))
+
+    split_pos: dict[str, list[int]] = {name: [] for name in _SPLIT_NAMES}
+    split_groups = dict.fromkeys(_SPLIT_NAMES, 0)
+    for label in sorted(strata):
+        groups = strata[label]
+        n = sum(len(p) for _, p in groups)
         n_test = int(round(n * test_frac))
-        n_val = int(round(n * val_frac))
-        n_val = min(n_val, n - n_test)
-        test_pos.append(pos[:n_test])
-        val_pos.append(pos[n_test:n_test + n_val])
-        train_pos.append(pos[n_test + n_val:])
+        n_val = min(int(round(n * val_frac)), n - n_test)
+        target = {"train": n - n_val - n_test, "val": n_val, "test": n_test}
+        filled = dict.fromkeys(_SPLIT_NAMES, 0)
 
-    def _take(parts: list[np.ndarray]) -> pd.DataFrame:
-        idx = np.concatenate(parts) if parts else np.array([], dtype=int)
-        idx = rng.permutation(idx)  # mix classes; still deterministic
+        # Seeded shuffle, then stable sort by size (largest first).
+        order = rng.permutation(len(groups))
+        order = sorted(order, key=lambda g: -len(groups[g][1]))
+        for g in order:
+            _, positions = groups[g]
+            # Split furthest below its target; ties -> train, val, test.
+            name = max(_SPLIT_NAMES, key=lambda s: target[s] - filled[s])
+            split_pos[name].extend(positions)
+            filled[name] += len(positions)
+            split_groups[name] += 1
+
+    def _take(positions: list[int]) -> pd.DataFrame:
+        idx = rng.permutation(np.asarray(positions, dtype=int))
         return df.iloc[idx].reset_index(drop=True)
 
-    return _take(train_pos), _take(val_pos), _take(test_pos)
+    parts = {name: _take(split_pos[name]) for name in _SPLIT_NAMES}
+    n_kept = len(df) - n_dropped
+    stats = {
+        "n_rows_input": len(df),
+        "n_groups": len(group_pos),
+        "n_conflict_groups": len(conflict_keys),
+        "n_rows_dropped": n_dropped,
+        "n_rows_kept": n_kept,
+        "split_rows": {name: len(parts[name]) for name in _SPLIT_NAMES},
+        "split_groups": split_groups,
+        "split_frac": {
+            name: (len(parts[name]) / n_kept if n_kept else 0.0) for name in _SPLIT_NAMES
+        },
+        "conflict_examples": conflict_keys[:_MAX_CONFLICT_EXAMPLES],
+    }
+    return parts["train"], parts["val"], parts["test"], stats

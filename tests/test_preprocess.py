@@ -26,6 +26,7 @@ from reviewlens.preprocess import (  # noqa: E402
     load_reviews,
     normalize_token,
     split_data,
+    split_data_with_stats,
 )
 
 # ---------------------------------------------------------------------------
@@ -341,6 +342,162 @@ def test_split_keeps_rows_with_missing_sentiment():
 def test_split_rejects_invalid_fractions(val_frac, test_frac):
     with pytest.raises(ValueError):
         split_data(_synthetic_df(), val_frac=val_frac, test_frac=test_frac)
+
+
+# ---------------------------------------------------------------------------
+# 9b. Leakage-free split: group by clean_text(review), drop conflict groups
+# ---------------------------------------------------------------------------
+
+
+def _leaky_df() -> pd.DataFrame:
+    """Synthetic data shaped like the real problem.
+
+    - 600 unique reviews (positive/negative/neutral);
+    - generic texts repeated across many items, with variants that only become
+      identical after clean_text ("Mantap!!", "MANTAAAP", "mantap");
+    - a few identical texts with different sentiment labels (conflicts).
+    """
+    rows = []
+    sentiments = ["positive"] * 360 + ["negative"] * 150 + ["neutral"] * 90
+    for i, s in enumerate(sentiments):
+        rows.append((f"ulasan unik nomor {i}", s))
+    # Note: "MANTAAAP" would clean to "mantaap" (3+ letters -> 2), a different group.
+    for variant in ["mantap", "Mantap!!", "MANTAP", "mantap 👍"] * 30:     # 120 rows, 1 group
+        rows.append((variant, "positive"))
+    for variant in ["barang bagus", "brg bagus", "Barang BAGUS."] * 10:   # 30 rows, 1 group
+        rows.append((variant, "positive"))
+    for variant in ["gak nyala", "ga nyala!", "tdk nyala"] * 8:            # 24 rows, 1 group
+        rows.append((variant, "negative"))
+    # Conflict groups: same cleaned text, more than one sentiment.
+    rows += [("lumayan", "positive"), ("Lumayan.", "neutral"), ("lumayan", "positive")]
+    rows += [("biasa aja", "neutral"), ("biasa saja", "negative")]          # aja -> saja
+    rows += [("ok", "positive"), ("oke", "positive"), ("OKE!", "neutral")]  # ok -> oke
+    df = pd.DataFrame(rows, columns=["review", "sentiment"])
+    df["item_id"] = np.arange(len(df))          # unique row id for the checks below
+    df["rating"] = 5.0
+    return df
+
+
+CONFLICT_KEYS = {"lumayan", "biasa saja", "oke"}
+
+
+def _keys(part: pd.DataFrame) -> set[str]:
+    return set(part["review"].map(clean_text))
+
+
+def test_no_clean_text_in_more_than_one_split():
+    train, val, test, _ = split_data_with_stats(_leaky_df())
+    k_tr, k_va, k_te = _keys(train), _keys(val), _keys(test)
+    assert not k_tr & k_va and not k_tr & k_te and not k_va & k_te
+
+
+def test_variants_identical_after_cleaning_form_one_group():
+    train, val, test, stats = split_data_with_stats(_leaky_df())
+    for key, n_rows in (("mantap", 120), ("barang bagus", 30), ("tidak nyala", 24)):
+        holders = [p for p in (train, val, test) if key in _keys(p)]
+        assert len(holders) == 1, key
+        assert (holders[0]["review"].map(clean_text) == key).sum() == n_rows
+    # 600 unique + 3 repeated groups + 3 conflict groups
+    assert stats["n_groups"] == 606
+
+
+def test_conflict_groups_are_dropped_entirely():
+    df = _leaky_df()
+    train, val, test, stats = split_data_with_stats(df)
+    kept = pd.concat([train, val, test])
+    assert not _keys(kept) & CONFLICT_KEYS
+    conflict_rows = df["review"].map(clean_text).isin(CONFLICT_KEYS).sum()
+    assert conflict_rows == 8
+    assert stats["n_conflict_groups"] == 3
+    assert stats["n_rows_dropped"] == 8
+    assert stats["n_rows_kept"] == len(df) - 8 == len(kept)
+    assert set(stats["conflict_examples"]) == CONFLICT_KEYS
+
+
+def test_same_sentiment_duplicates_are_all_kept():
+    train, val, test, _ = split_data_with_stats(_leaky_df())
+    kept = pd.concat([train, val, test])
+    assert (kept["review"].map(clean_text) == "mantap").sum() == 120
+    # original (uncleaned) variants are preserved as-is
+    assert set(kept["review"]) >= {"mantap", "Mantap!!", "MANTAP", "mantap 👍"}
+
+
+def test_labels_and_values_unchanged():
+    df = _leaky_df()
+    original = df.set_index("item_id")
+    train, val, test, _ = split_data_with_stats(df)
+    kept = pd.concat([train, val, test]).set_index("item_id")
+    pd.testing.assert_frame_equal(kept.sort_index(), original.loc[kept.index].sort_index())
+
+
+def test_non_conflict_rows_appear_exactly_once():
+    df = _leaky_df()
+    train, val, test, stats = split_data_with_stats(df)
+    ids = pd.concat([train, val, test])["item_id"].tolist()
+    assert len(ids) == len(set(ids))
+    expected = set(df.loc[~df["review"].map(clean_text).isin(CONFLICT_KEYS), "item_id"])
+    assert set(ids) == expected
+    assert stats["split_rows"] == {"train": len(train), "val": len(val), "test": len(test)}
+    assert sum(stats["split_groups"].values()) == stats["n_groups"] - stats["n_conflict_groups"]
+
+
+def test_group_split_is_deterministic():
+    df = _leaky_df()
+    a = split_data_with_stats(df, seed=42)
+    b = split_data_with_stats(df, seed=42)
+    for x, y in zip(a[:3], b[:3]):
+        pd.testing.assert_frame_equal(x, y)
+    assert a[3] == b[3]
+    # Row order of the input does not change which split a row ends up in.
+    shuffled = df.sample(frac=1.0, random_state=0).reset_index(drop=True)
+    c = split_data_with_stats(shuffled, seed=42)
+    for x, y in zip(a[:3], c[:3]):
+        assert set(x["item_id"]) == set(y["item_id"])
+
+
+def test_proportions_close_to_80_10_10_in_rows():
+    _, _, _, stats = split_data_with_stats(_leaky_df())
+    frac = stats["split_frac"]
+    assert abs(frac["train"] - 0.8) < 0.02
+    assert abs(frac["val"] - 0.1) < 0.02
+    assert abs(frac["test"] - 0.1) < 0.02
+
+
+def test_large_group_handled_as_one_unit():
+    # One group holds 40% of the positive stratum.
+    rows = [("mantap", "positive")] * 400 + [(f"unik {i}", "positive") for i in range(600)]
+    rows += [(f"jelek {i}", "negative") for i in range(200)]
+    df = pd.DataFrame(rows, columns=["review", "sentiment"])
+    train, val, test, stats = split_data_with_stats(df)
+    holders = [n for n, p in zip(("train", "val", "test"), (train, val, test))
+               if "mantap" in set(p["review"])]
+    assert holders == ["train"]                      # largest group -> furthest below target
+    assert (train["review"] == "mantap").sum() == 400
+    assert stats["split_rows"] == {"train": 960, "val": 120, "test": 120}
+    assert (val["sentiment"] == "positive").sum() == 100
+    assert (test["sentiment"] == "negative").sum() == 20
+
+
+def test_group_larger_than_val_and_test_targets():
+    # Every row identical: the only group cannot be split, so it all goes to train.
+    df = pd.DataFrame({"review": ["Mantap!"] * 50, "sentiment": ["positive"] * 50})
+    train, val, test, stats = split_data_with_stats(df)
+    assert (len(train), len(val), len(test)) == (50, 0, 0)
+    assert list(val.columns) == list(test.columns) == ["review", "sentiment"]
+    assert stats["n_conflict_groups"] == 0
+
+
+def test_split_data_matches_split_data_with_stats():
+    df = _leaky_df()
+    plain = split_data(df)
+    full = split_data_with_stats(df)
+    for x, y in zip(plain, full[:3]):
+        pd.testing.assert_frame_equal(x, y)
+
+
+def test_split_requires_review_column():
+    with pytest.raises(ValueError, match="review"):
+        split_data(pd.DataFrame({"sentiment": ["positive"]}))
 
 
 # ---------------------------------------------------------------------------
