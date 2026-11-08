@@ -3,7 +3,8 @@
 **Indonesian Customer Review Insight Generator dengan Mini-GPT from scratch**
 
 Tugas mata kuliah Generative AI · Tenggat: **Senin, 9 November 2026**
-Status dokumen: **Revisi 2 — siap ditinjau untuk persetujuan tim**
+Status dokumen: **Revisi 2.1 — siap ditinjau untuk persetujuan tim**
+(2.1: target padding memakai `IGNORE_INDEX = -100`, lihat §8.4)
 Dokumen pasangan: [INTERFACES.md](INTERFACES.md) (kontrak antar-modul).
 Jika ada perbedaan detail teknis, INTERFACES.md yang berlaku.
 
@@ -109,7 +110,8 @@ Catatan:
 | Decoder-only Mini-Transformer | `MiniGPT`: token emb + pos emb → N × `TransformerBlock` → LayerNorm → LM head |
 | Multi-Head Self-Attention manual | `MultiHeadSelfAttention` menghitung Q, K, V dan `softmax(QKᵀ/√d)·V` sendiri; **tidak** memakai `nn.MultiheadAttention` / `F.scaled_dot_product_attention` |
 | Causal masking | Buffer matriks segitiga bawah; posisi masa depan diisi `-inf` sebelum softmax; dibuktikan dengan unit test |
-| Next-token prediction | Loss `cross_entropy(logits(x), y)` dengan `x = ids[:-1]`, `y = ids[1:]` |
+| Next-token prediction | Loss `cross_entropy(logits(x), y, ignore_index=IGNORE_INDEX)` dengan `x = ids[:-1]`, `y = ids[1:]`; padding `x` = `PAD` (0), padding `y` = `IGNORE_INDEX` (-100) |
+| Model independen dari data | `model.py` hanya bergantung pada `attention.py` dan `config.py`; tidak meng-import `tokenizer.py`/`preprocess.py` sehingga tidak perlu tahu ID token khusus |
 | Random init | `_init_weights`: Normal(0, 0.02), bias 0; tanpa memuat bobot eksternal |
 | Tanpa pretrained LM | Tokenizer dan embedding dibangun dari korpus sendiri |
 | Tanpa API LLM | Inferensi 100% lokal dari checkpoint sendiri |
@@ -169,7 +171,7 @@ reviewlens-mini-gpt/
 ├── checkpoints/              # gitignored: best.pt, last.pt, history.json, vocab.json, eval.json
 ├── src/reviewlens/
 │   ├── __init__.py
-│   ├── config.py             # ModelConfig, TrainConfig, Paths, get_device()
+│   ├── config.py             # ModelConfig, TrainConfig, Paths, get_device(), IGNORE_INDEX
 │   ├── preprocess.py         # load CSV + mapping kolom, cleaning, normalisasi, split
 │   ├── labeling.py           # lexicon aspek → silver insight
 │   ├── tokenizer.py          # WordTokenizer + token khusus
@@ -257,6 +259,20 @@ Pre-LayerNorm dipilih karena lebih stabil untuk training singkat.
 - Batas ulasan yang sama dipakai saat inferensi, sehingga prompt ditambah token
   hasil generate tidak pernah melebihi `block_size` (perhitungan di
   INTERFACES.md §7).
+
+### 8.4 Padding dan target yang diabaikan loss
+
+Keputusan tim: target padding memakai **`IGNORE_INDEX = -100`**, bukan `PAD = 0`.
+
+- `PAD` tetap ber-ID 0 dan hanya dipakai untuk padding **input** `x`.
+- Padding **target** `y` memakai `IGNORE_INDEX` (-100), yang didefinisikan
+  sekali di `config.py`. Dataset tidak boleh mengirim `PAD` (0) sebagai target
+  padding.
+- `MiniGPT` menghitung `F.cross_entropy(..., ignore_index=-100)`; `estimate_loss`
+  dan `test_perplexity` juga hanya menghitung posisi `y != -100`.
+- Alasan: `model.py` tidak perlu mengetahui ID token khusus, sehingga tetap
+  tidak bergantung pada `tokenizer.py` atau `preprocess.py`.
+- Detail kontrak: INTERFACES.md §2.3 dan §7 (`collate_fn`).
 
 ## 9. Lingkungan Pengembangan & Training
 

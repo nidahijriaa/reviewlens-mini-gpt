@@ -1,6 +1,8 @@
 # INTERFACES — Kontrak Antar-Modul ReviewLens GPT
 
-Status: **Revisi 2 — siap ditinjau untuk persetujuan tim.**
+Status: **Revisi 2.1 — siap ditinjau untuk persetujuan tim.**
+Revisi 2.1: target padding memakai `IGNORE_INDEX = -100` dari `config.py`
+(bukan `PAD`); lihat §2.3, §3, §7, §8, §9, §11, §14.
 Signature di bawah adalah kontrak. Implementasi boleh menambah helper privat
 (`_nama`), tetapi tidak boleh mengubah signature publik tanpa memperbarui
 dokumen ini. Konteks proyek ada di [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md).
@@ -37,7 +39,10 @@ flowchart LR
 Aturan:
 - Tidak boleh ada import melingkar.
 - `attention.py` dan `model.py` **tidak** tahu apa pun tentang data atau
-  tokenizer. Keduanya hanya menerima tensor ID atau embedding.
+  tokenizer. Keduanya hanya menerima tensor ID atau embedding, dan **tidak
+  boleh** meng-import `tokenizer.py` atau `preprocess.py`. Satu-satunya
+  dependensi internal `model.py` adalah `attention.py` dan `config.py`
+  (termasuk `IGNORE_INDEX`, lihat §2.3).
 - `app/` hanya memakai API publik `inference.py`.
 
 ---
@@ -48,7 +53,7 @@ Aturan:
 
 | Konstanta | Token | ID tetap | Fungsi |
 |---|---|---|---|
-| `PAD` | `<pad>` | 0 | padding; diabaikan loss (`ignore_index=PAD`) |
+| `PAD` | `<pad>` | 0 | padding **input** `x`; tidak pernah dipakai sebagai target padding (lihat §2.3) |
 | `UNK` | `<unk>` | 1 | kata di luar vocab |
 | `BOS` | `<bos>` | 2 | awal sekuens |
 | `EOS` | `<eos>` | 3 | akhir sekuens / berhenti generate |
@@ -77,11 +82,31 @@ Contoh bagian kosong: `<neg> <none> <sug> <none>`.
 | `MAX_REVIEW_TOKENS` | `block_size + 1 − 2 − 48` = 79 | kata ulasan maksimum (training **dan** inferensi) |
 | `MAX_NEW_TOKENS` | `MAX_TARGET_TOKENS − 1` = 47 | token yang di-generate setelah prompt yang berakhir `<pos>` |
 
+### 2.3 Padding & target yang diabaikan loss (`config.py`)
+
+| Konstanta | Nilai | Didefinisikan di | Dipakai untuk |
+|---|---|---|---|
+| `PAD` | 0 | `tokenizer.py` | padding kanan **input** `x` |
+| `IGNORE_INDEX` | -100 | `config.py` (satu sumber kebenaran) | padding kanan **target** `y`; diabaikan oleh loss |
+
+Aturan:
+- `PAD` tetap ber-ID 0 dan tetap ada di vocab (§2.1).
+- Padding `x` memakai `PAD` (0). Padding `y` memakai `IGNORE_INDEX` (-100).
+- **Dataset tidak boleh mengirim `PAD` (0) sebagai target padding.**
+- `MiniGPT.forward` memakai `F.cross_entropy(..., ignore_index=IGNORE_INDEX)`.
+- `estimate_loss` (§9) dan `test_perplexity` (§11) juga hanya merata-ratakan
+  posisi dengan `y != IGNORE_INDEX`.
+- Alasan: `model.py` tidak perlu mengetahui ID token khusus sehingga tidak
+  bergantung pada `tokenizer.py`. `IGNORE_INDEX` di-import dari `config.py`
+  (`model.py` juga mengekspornya ulang untuk kompatibilitas).
+
 ---
 
 ## 3. `config.py`
 
 ```python
+IGNORE_INDEX: int = -100       # target padding diabaikan loss (§2.3); bukan PAD
+
 @dataclass
 class ModelConfig:
     vocab_size: int            # diisi dari tokenizer (6.000–10.000)
@@ -247,7 +272,7 @@ Kontrak:
 | `format_target(label: InsightLabel) -> str` | label | `"<pos> … <neg> … <sug> … <eos>"` |
 | `encode_example(review_clean, label, tokenizer, block_size) -> list[int]` | ulasan + label | ID sekuens lengkap, **`len ≤ block_size + 1`** |
 | `class ReviewInsightDataset(Dataset)` | `jsonl_path, tokenizer, block_size` | item: `LongTensor` hasil `encode_example` |
-| `collate_fn(batch: list[LongTensor]) -> tuple[LongTensor, LongTensor]` | list sekuens | `(x, y)` |
+| `collate_fn(batch: list[LongTensor]) -> tuple[LongTensor, LongTensor]` | list sekuens | `(x, y)`; `x` dipad `PAD`, `y` dipad `IGNORE_INDEX` |
 
 Aturan truncation di `encode_example`:
 1. Target di-encode terlebih dahulu. Jika melebihi `MAX_TARGET_TOKENS`, item
@@ -261,9 +286,23 @@ Aturan truncation di `encode_example`:
 `collate_fn`:
 - Untuk tiap sekuens: `x = ids[:-1]`, `y = ids[1:]`. Panjang keduanya sama dan
   `≤ block_size`.
-- Padding kanan dengan `PAD` sampai panjang maksimum di batch. Bentuk `x` dan
-  `y` sama, yaitu `(B, T)` dengan `T ≤ block_size`. Posisi PAD di `y` diabaikan
-  oleh loss.
+- Padding kanan sampai panjang maksimum di batch (`T`):
+  - `x` dipad dengan **`PAD` (0)**;
+  - `y` dipad dengan **`IGNORE_INDEX` (-100)**, **bukan** `PAD`.
+- Bentuk `x` dan `y` sama, yaitu `(B, T)` dengan `T ≤ block_size`, keduanya
+  `torch.long`.
+- Hanya posisi padding yang bernilai -100 di `y`. Token asli di `y` (termasuk
+  `<eos>`) tetap memakai ID aslinya sehingga ikut dihitung loss.
+
+```python
+# contoh, PAD = 0, IGNORE_INDEX = -100
+ids_a = [2, 4, 15, 5, 9, 6, 9, 7, 9, 3]   # panjang 10 -> x/y panjang 9
+ids_b = [2, 4, 5, 9, 6, 9, 7, 9, 3]       # panjang 9  -> x/y panjang 8
+x = [[2, 4, 15, 5, 9, 6, 9, 7, 9],
+     [2, 4,  5, 9, 6, 9, 7, 9, 0]]         # pad PAD
+y = [[4, 15, 5, 9, 6, 9, 7, 9, 3],
+     [4,  5, 9, 6, 9, 7, 9, 3, -100]]      # pad IGNORE_INDEX
+```
 
 Inferensi (cek konsistensi):
 - Panjang prompt = `2 + r + 1`, dengan `r ≤ 79`, sehingga maksimal 82.
@@ -309,7 +348,8 @@ class MiniGPT(nn.Module):
                ) -> tuple[Tensor, Tensor | None]:
         # idx (B, T), T <= block_size (assert)
         # return logits (B, T, vocab_size), loss skalar atau None
-        # loss = F.cross_entropy(logits.view(-1, V), targets.view(-1), ignore_index=PAD)
+        # loss = F.cross_entropy(logits.view(-1, V), targets.view(-1),
+        #                        ignore_index=IGNORE_INDEX)   # -100, dari config.py (§2.3)
     @torch.no_grad()
     def generate(self, idx: LongTensor, max_new_tokens: int,
                  temperature: float = 1.0, top_k: int | None = None,
@@ -337,7 +377,7 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig, paths: Paths,
 
 def estimate_loss(model: MiniGPT, loader: DataLoader, device: str,
                   max_batches: int | None = None) -> float:
-    # rata-rata token NLL pada token non-PAD (model.eval(), no_grad)
+    # rata-rata token NLL atas posisi dengan y != IGNORE_INDEX (model.eval(), no_grad)
 
 def lr_at(step: int, train_cfg: TrainConfig, total_steps: int) -> float:
     # warmup linear lalu cosine decay; fungsi murni dari step -> tidak perlu scheduler state
@@ -481,7 +521,7 @@ Output dict sekaligus isi file JSON (nama kunci identik di fungsi, CLI, dan file
 
 | Kunci | Definisi | Data |
 |---|---|---|
-| `test_perplexity` | `exp(rata-rata token NLL)` atas token non-PAD pada sekuens lengkap (teacher forcing, sama seperti loss training) | **seluruh** `test_jsonl` |
+| `test_perplexity` | `exp(rata-rata token NLL)` atas posisi target `y != IGNORE_INDEX` (-100) pada sekuens lengkap (teacher forcing, sama seperti loss training) | **seluruh** `test_jsonl` |
 | `format_validity` | proporsi output dengan `valid_format=True`, rentang 0–1 | `limit` contoh pertama |
 | `aspect_f1` | micro-F1 himpunan frasa hasil generate vs silver label, per bagian dan gabungan (`micro`). Karena tiap frasa berpasangan dengan tepat satu (aspek, polaritas) (§5), skor ini setara F1 tingkat aspek. Frasa di luar lexicon dihitung sebagai false positive. | `limit` contoh pertama |
 | `exact_match` | proporsi contoh yang ketiga himpunan frasanya sama persis dengan silver label, rentang 0–1 | `limit` contoh pertama |
@@ -538,10 +578,11 @@ CSV asli tidak pernah ditulis. Semua output masuk ke `--out-dir`.
 | `test_preprocess.py` | mapping kolom (`reviewContent→review`, dll.); `clean_text("gak cepat") == "tidak cepat"`, `"ga"` → `"tidak"` |
 | `test_labeling.py` | "tidak cepat" dan "gak cepat" → pain point pengiriman; fallback sentimen; frasa lexicon unik |
 | `test_tokenizer.py` | round-trip, ID token khusus 0–9, save/load |
-| `test_dataset.py` | ulasan 300 kata → `len(ids) ≤ block_size+1`, target utuh; `x.shape == y.shape`, `T ≤ block_size` |
+| `test_config.py` | default hyperparameter; `IGNORE_INDEX == -100` dan berbeda dari semua ID token khusus |
+| `test_dataset.py` | ulasan 300 kata → `len(ids) ≤ block_size+1`, target utuh; `x.shape == y.shape`, `T ≤ block_size`; padding `x` = `PAD`, padding `y` = `IGNORE_INDEX`, tidak ada `PAD` sebagai target padding |
 | `test_attention.py::test_causal_mask` | mengubah token di posisi > t tidak mengubah output di posisi ≤ t |
 | `test_attention.py::test_shape` | `(B,T,d) → (B,T,d)` |
-| `test_model.py::test_forward_loss` | loss awal ≈ `ln(vocab_size)` (bukti inisialisasi acak) |
+| `test_model.py::test_forward_loss` | loss awal ≈ `ln(vocab_size)` (bukti inisialisasi acak); target -100 diabaikan |
 | `test_model.py::test_param_count` | `num_parameters()` sesuai rumus §8 untuk V kecil |
 | `test_model.py::test_overfit_batch` | loss < 0.1 setelah ~200 step pada 1 batch |
 | `test_model.py::test_generate_length` | panjang output ≤ input + `max_new_tokens` |

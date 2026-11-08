@@ -15,12 +15,52 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from reviewlens.config import (  # noqa: E402
+    IGNORE_INDEX,
     ModelConfig,
     Paths,
     TrainConfig,
     get_device,
     set_seed,
 )
+
+
+# ---------------------------------------------------------------------------
+# IGNORE_INDEX (INTERFACES.md section 2.3)
+# ---------------------------------------------------------------------------
+def test_ignore_index_value():
+    assert IGNORE_INDEX == -100
+    assert type(IGNORE_INDEX) is int
+
+
+def test_ignore_index_never_collides_with_token_ids():
+    # Special tokens use IDs 0-9 (PAD = 0) and every vocab ID is >= 0, so a
+    # negative IGNORE_INDEX can never mask a real target token.
+    assert IGNORE_INDEX < 0
+    assert IGNORE_INDEX not in range(0, 10)
+
+
+def test_ignore_index_matches_cross_entropy_default():
+    import inspect
+
+    import torch.nn.functional as F
+
+    default = inspect.signature(F.cross_entropy).parameters["ignore_index"].default
+    assert IGNORE_INDEX == default
+
+
+def test_ignore_index_masks_targets_in_cross_entropy():
+    logits = torch.randn(4, 7)
+    targets = torch.tensor([1, 2, IGNORE_INDEX, IGNORE_INDEX])
+    loss = torch.nn.functional.cross_entropy(logits, targets, ignore_index=IGNORE_INDEX)
+    expected = torch.nn.functional.cross_entropy(logits[:2], targets[:2])
+    torch.testing.assert_close(loss, expected)
+
+
+def test_model_reexports_same_ignore_index():
+    from reviewlens import model
+
+    assert model.IGNORE_INDEX is IGNORE_INDEX
+    assert "IGNORE_INDEX" in model.__all__
 
 
 # ---------------------------------------------------------------------------

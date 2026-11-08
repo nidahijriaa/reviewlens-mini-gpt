@@ -21,7 +21,18 @@ from pathlib import Path
 import numpy as np
 import torch
 
-__all__ = ["ModelConfig", "TrainConfig", "Paths", "get_device", "set_seed"]
+__all__ = ["IGNORE_INDEX", "ModelConfig", "TrainConfig", "Paths", "get_device", "set_seed"]
+
+
+# ---------------------------------------------------------------------------
+# Shared constants
+# ---------------------------------------------------------------------------
+#: Target value skipped by the loss (``F.cross_entropy(..., ignore_index=IGNORE_INDEX)``).
+#: Single source of truth (INTERFACES.md sections 2.1, 7, 8, 9, 11):
+#: - input padding in ``x`` uses ``PAD`` (= 0, defined in tokenizer.py);
+#: - target padding in ``y`` uses ``IGNORE_INDEX`` (-100), never ``PAD``.
+#: Keeping it here lets model.py stay independent of tokenizer.py.
+IGNORE_INDEX: int = -100
 
 
 # ---------------------------------------------------------------------------
