@@ -169,7 +169,63 @@ OPTIONAL_COLUMNS = ("confidence",)   # dibaca jika ada, tidak dipakai di MVP
 | `load_reviews(csv_path: Path) -> pd.DataFrame` | path CSV | DataFrame kolom `review, sentiment, rating, item_id` (+`confidence`) | `pd.read_csv(usecols=...)` lalu `rename(columns=COLUMN_MAP)` di memori. File asli tidak pernah ditulis. Error jelas jika kolom wajib hilang. Membuang baris dengan `review` kosong dan duplikat `(item_id, review)`. `rating` NaN diizinkan. |
 | `clean_text(text: str) -> str` | teks mentah | teks bersih | lowercase → hapus URL/emoji/tanda baca → huruf berulang ≥3 menjadi 2 ("mantaaap" → "mantaap") → `normalize_token` per kata → rapikan spasi. **Wajib identik saat training dan inferensi.** |
 | `normalize_token(token: str) -> str` | satu kata | kata ternormalisasi | memakai `NEGATION_MAP` lalu `SLANG_MAP` |
-| `split_data(df, val_frac=0.1, test_frac=0.1, seed=42) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]` | DataFrame | train, val, test | stratified berdasarkan `sentiment` |
+| `split_data(df, val_frac=0.1, test_frac=0.1, seed=42) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]` | DataFrame (wajib kolom `review`, `sentiment`) | `(train, val, test)` | split berkelompok berdasarkan `clean_text(review)`, stratified per `sentiment`; perilaku identik dengan `split_data_with_stats` tanpa statistik |
+| `split_data_with_stats(df, val_frac=0.1, test_frac=0.1, seed=42) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]` | DataFrame (wajib kolom `review`, `sentiment`) | `(train, val, test, stats)` | algoritme sama dengan `split_data`, ditambah dict statistik; dipakai `scripts/prepare_data.py` |
+
+#### Split berkelompok (`split_data` / `split_data_with_stats`)
+
+Tujuan: ulasan yang identik setelah dibersihkan tidak pernah muncul di dua split
+berbeda (mencegah kebocoran train → val/test). `split_data` hanya memanggil
+`split_data_with_stats` dan membuang `stats`, sehingga keduanya selalu
+menghasilkan train/val/test yang sama untuk input dan `seed` yang sama.
+
+1. **Pengelompokan.** Kunci kelompok adalah `clean_text(review)`. Teks yang
+   hanya berbeda pada huruf besar/kecil, tanda baca, emoji, URL, slang, atau
+   huruf berulang menjadi satu kelompok.
+2. **Keputusan A2 — kelompok konflik dibuang.** Kelompok dengan lebih dari satu
+   nilai `sentiment` berbeda dibuang **seluruhnya** (semua barisnya). Sentimen
+   yang hilang (NaN/None) dihitung sebagai nilai tersendiri (`"<NA>"`). Label
+   tidak pernah diubah atau dipilih ulang.
+3. **Keputusan B1 — duplikat sesentimen dipertahankan.** Semua baris dengan
+   teks bersih identik dan sentimen sama tetap dipertahankan (tidak
+   di-deduplikasi) dan ditempatkan bersama di **satu** split.
+4. **Stratifikasi berbasis kelompok.** Kelompok non-konflik dipisah per
+   `sentiment` (strata diproses dalam urutan terurut). Untuk setiap stratum
+   dengan `n` baris, target baris adalah `n_test = round(n * test_frac)`,
+   `n_val = min(round(n * val_frac), n - n_test)`, dan
+   `n_train = n - n_val - n_test` (default 80/10/10). Kelompok diurutkan dari
+   yang terbesar (kelompok berukuran sama dalam urutan acak ber-seed), lalu
+   setiap kelompok dimasukkan ke split yang paling jauh di bawah target
+   barisnya (seri → `train`, `val`, `test`). Jika semua kelompok berisi satu
+   baris, jumlah per kelas tepat sama dengan target; kelompok besar dapat
+   membuat proporsi hanya mendekati 80/10/10.
+5. **Determinisme.** Satu `np.random.default_rng(seed)` (default `seed=42`)
+   dipakai untuk urutan kelompok dan untuk mengacak baris di dalam setiap
+   split. Kelompok diiterasi dalam urutan kunci terurut, sehingga hasil
+   deterministik untuk input dan `seed` yang sama. Index direset; kolom dan
+   nilai input tidak diubah (kolom `review` keluaran tetap teks input, bukan
+   kunci kelompok).
+6. **Validasi.** `ValueError` jika kolom `review` atau `sentiment` tidak ada,
+   atau jika fraksi tidak memenuhi `0 <= val_frac < 1`, `0 <= test_frac < 1`,
+   `val_frac + test_frac < 1`.
+
+Isi `stats` dari `split_data_with_stats`:
+
+| Kunci | Tipe | Arti |
+|---|---|---|
+| `n_rows_input` | `int` | jumlah baris `df` yang masuk ke split |
+| `n_groups` | `int` | jumlah kelompok `clean_text(review)` unik, **termasuk** kelompok konflik |
+| `n_conflict_groups` | `int` | jumlah kelompok dengan lebih dari satu sentimen (dibuang) |
+| `n_rows_dropped` | `int` | total baris di kelompok konflik |
+| `n_rows_kept` | `int` | `n_rows_input - n_rows_dropped` = total baris train + val + test |
+| `split_rows` | `dict[str, int]` | jumlah baris per split (`train`, `val`, `test`) |
+| `split_groups` | `dict[str, int]` | jumlah kelompok per split |
+| `split_frac` | `dict[str, float]` | `split_rows[s] / n_rows_kept` (`0.0` jika `n_rows_kept == 0`) |
+| `conflict_examples` | `list[str]` | maksimal 10 kunci (teks bersih) kelompok konflik, urut alfabetis |
+
+Statistik ini menggambarkan hasil split itu sendiri, jadi dihitung **sebelum
+oversampling**. Oversampling ulasan negatif (§13) dilakukan setelahnya, hanya
+pada train, dan tidak memengaruhi `stats`.
 
 ### 4.2 Normalisasi negasi (satu sumber kebenaran)
 
@@ -562,10 +618,34 @@ python scripts/prepare_data.py --csv "data/raw/Processed Dataset.csv" --out-dir 
 ```
 
 Langkah: `load_reviews` (mapping kolom di memori) → `clean_text` → buang ulasan
-kosong → `split_data` → `label_review` → oversampling ulasan negatif **hanya
-pada train** → tulis `train/val/test.jsonl` → `WordTokenizer.build` (train) →
-`save(vocab.json)` → cetak statistik (distribusi sentimen dan aspek,
-`vocab_size`, persentase ulasan yang terpotong 79 kata).
+kosong → `split_data_with_stats` (berkelompok, kelompok konflik dibuang, §4.1)
+→ silver labeling (`label_review`) → oversampling ulasan negatif **hanya pada
+train** → tulis `train/val/test.jsonl` → build vocabulary dari train.
+
+Catatan: `prepare_data.py` sendiri berhenti setelah menulis JSONL dan mencetak
+statistik; vocabulary (`WordTokenizer.build` → `save(vocab.json)`) dibangun
+terpisah **hanya** dari `train.jsonl` (§6).
+
+Statistik yang dikembalikan `prepare()` dan dicetak:
+
+- `n_loaded` — baris hasil `load_reviews`.
+- `n_empty_after_clean` — baris yang menjadi kosong setelah `clean_text`.
+- `n_after_clean` — baris setelah `clean_text` dan pembuangan ulasan kosong;
+  ini input split (= `split_stats["n_rows_input"]`), **sebelum** kelompok
+  konflik dibuang.
+- `split_stats` — dict `stats` dari `split_data_with_stats` (§4.1).
+- `n_used` — `split_stats["n_rows_kept"]`, yaitu baris yang benar-benar masuk
+  train/val/test (setelah kelompok konflik dibuang, sebelum oversampling).
+- `split_sizes` — jumlah record per split sebelum oversampling;
+  `written_sizes` — jumlah baris yang ditulis ke JSONL (train sudah
+  di-oversample).
+- distribusi sentimen per split, frekuensi frasa aspek (termasuk salinan hasil
+  oversampling), persentase ulasan yang terpotong `MAX_REVIEW_TOKENS` kata, dan
+  `shared_review_texts` (jumlah teks review yang sama antar-split; diharapkan
+  0).
+
+`ValueError` jika tidak ada ulasan tersisa setelah pembersihan, atau jika
+semua baris berada di kelompok konflik (`n_rows_kept == 0`).
 
 CSV asli tidak pernah ditulis. Semua output masuk ke `--out-dir`.
 
