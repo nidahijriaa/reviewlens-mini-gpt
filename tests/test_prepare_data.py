@@ -172,7 +172,8 @@ def test_empty_and_duplicate_rows_are_dropped(csv_path, tmp_path):
     # 203 CSV rows: 1 duplicate + 1 empty dropped by load_reviews, 1 empty after clean_text.
     assert stats["n_loaded"] == 201
     assert stats["n_empty_after_clean"] == 1
-    assert stats["n_used"] == 200
+    assert stats["n_after_clean"] == 200
+    assert stats["n_used"] == stats["split_stats"]["n_rows_kept"] == 200   # no conflicts here
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +316,10 @@ def test_cli_main(csv_path, tmp_path, capsys):
     assert prep.main(["--csv", str(csv_path), "--out-dir", str(out)]) == 0
     assert {p.name for p in out.iterdir()} == {"train.jsonl", "val.jsonl", "test.jsonl"}
     printed = capsys.readouterr().out
-    assert "Split (seed=42" in printed and "Tokenizer NOT fitted" in printed
+    assert "Grouped split (seed=42" in printed and "Tokenizer NOT fitted" in printed
+    for key in ("n_rows_input", "n_groups", "n_conflict_groups", "n_rows_dropped",
+                "n_rows_kept", "split_rows", "split_frac", "conflict_examples"):
+        assert key in printed, key
 
 
 def test_cli_defaults_follow_paths_contract():
@@ -323,3 +327,109 @@ def test_cli_defaults_follow_paths_contract():
     p = Paths()
     assert p.raw_csv == Path("data/raw/Processed Dataset.csv")
     assert p.data_dir == Path("data/processed")
+
+
+# ---------------------------------------------------------------------------
+# Grouped split statistics (split_data_with_stats) and conflict groups
+# ---------------------------------------------------------------------------
+SPLIT_STAT_KEYS = {"n_rows_input", "n_groups", "n_conflict_groups", "n_rows_dropped",
+                   "n_rows_kept", "split_rows", "split_frac", "conflict_examples"}
+N_CONFLICT_GROUPS = 12                     # > 10, to check the example limit
+
+
+def make_conflict_df() -> pd.DataFrame:
+    """Base data + 12 conflict groups (2 rows each) + 1 same-label group (3 rows)."""
+    df = make_df()
+    extra = []
+    for k in range(N_CONFLICT_GROUPS):
+        text = f"konflik nomor {k} barangnya"
+        extra.append({**df.iloc[0].to_dict(), "itemId": 500000 + k, "reviewContent": text,
+                      "sentiment_label": "positive"})
+        # Differs only in case/punctuation -> same clean_text group, other sentiment.
+        extra.append({**df.iloc[0].to_dict(), "itemId": 600000 + k,
+                      "reviewContent": text.upper() + "!!", "sentiment_label": "negative"})
+    for k in range(3):                     # same text and label from 3 products: kept
+        extra.append({**df.iloc[0].to_dict(), "itemId": 700000 + k,
+                      "reviewContent": "Barang sampai dengan selamat", "sentiment_label": "positive"})
+    return pd.concat([df, pd.DataFrame(extra)], ignore_index=True)
+
+
+@pytest.fixture()
+def conflict_csv(tmp_path) -> Path:
+    path = tmp_path / "conflict" / "Processed Dataset.csv"
+    path.parent.mkdir()
+    make_conflict_df().to_csv(path, index=False)
+    return path
+
+
+def test_split_stats_are_returned(csv_path, tmp_path):
+    stats = run(csv_path, tmp_path / "out", neg_oversample=1.0)
+    ss = stats["split_stats"]
+    assert SPLIT_STAT_KEYS <= ss.keys()
+    assert ss["n_rows_input"] == stats["n_after_clean"] == 200
+    assert ss["n_conflict_groups"] == ss["n_rows_dropped"] == 0
+    assert ss["n_rows_kept"] == 200
+    assert ss["split_rows"] == stats["split_sizes"] == {"train": 160, "val": 20, "test": 20}
+    assert ss["split_frac"] == pytest.approx({"train": 0.8, "val": 0.1, "test": 0.1})
+    assert ss["conflict_examples"] == []
+
+
+def test_conflict_groups_are_dropped_and_reported(conflict_csv, tmp_path):
+    out = tmp_path / "out"
+    stats = run(conflict_csv, out, neg_oversample=1.0)
+    ss = stats["split_stats"]
+    n_in = 200 + 2 * N_CONFLICT_GROUPS + 3
+    assert stats["n_after_clean"] == ss["n_rows_input"] == n_in
+    assert ss["n_conflict_groups"] == N_CONFLICT_GROUPS
+    assert ss["n_rows_dropped"] == 2 * N_CONFLICT_GROUPS
+    assert ss["n_rows_kept"] == stats["n_used"] == n_in - 2 * N_CONFLICT_GROUPS
+    assert ss["n_groups"] == 200 + N_CONFLICT_GROUPS + 1
+    assert len(ss["conflict_examples"]) == 10                        # capped at 10
+    assert all(t.startswith("konflik nomor") for t in ss["conflict_examples"])
+
+    recs = {n: read_jsonl(out / f"{n}.jsonl") for n in prep.SPLITS}
+    assert {n: len(r) for n, r in recs.items()} == ss["split_rows"]
+    assert sum(ss["split_rows"].values()) == ss["n_rows_kept"]
+    texts = [r["review"] for n in prep.SPLITS for r in recs[n]]
+    assert not any(t.startswith("konflik nomor") for t in texts)     # dropped, not relabelled
+    # Same-label group kept intact in exactly one split.
+    holders = [n for n in prep.SPLITS
+               if any(r["review"] == "barang sampai dengan selamat" for r in recs[n])]
+    assert len(holders) == 1
+    assert sum(r["review"] == "barang sampai dengan selamat" for r in recs[holders[0]]) == 3
+    assert stats["shared_review_texts"] == {"train&val": 0, "train&test": 0, "val&test": 0}
+
+
+def test_oversampling_still_train_only_with_conflicts(conflict_csv, tmp_path):
+    base, over = tmp_path / "base", tmp_path / "over"
+    s1 = run(conflict_csv, base, neg_oversample=1.0)
+    s2 = run(conflict_csv, over, neg_oversample=2.0)
+    assert s1["split_stats"] == s2["split_stats"]
+    for name in ("val", "test"):
+        assert (base / f"{name}.jsonl").read_bytes() == (over / f"{name}.jsonl").read_bytes()
+    neg = lambda p: sum(r["sentiment"] == "negative" for r in read_jsonl(p))  # noqa: E731
+    assert neg(over / "train.jsonl") == 2 * neg(base / "train.jsonl")
+    assert s2["written_sizes"]["train"] > s2["split_stats"]["split_rows"]["train"]
+
+
+def test_cli_prints_conflict_stats(conflict_csv, tmp_path, capsys):
+    out = tmp_path / "out"
+    assert prep.main(["--csv", str(conflict_csv), "--out-dir", str(out)]) == 0
+    printed = capsys.readouterr().out
+    assert "n_conflict_groups : 12" in printed
+    assert "n_rows_dropped    : 24" in printed
+    assert f"n_rows_kept       : {200 + 3}" in printed
+    assert "enter the split (before conflict removal)" in printed
+    assert "conflict_examples : 10 shown of 12" in printed
+    assert printed.count("    - 'konflik nomor") == 10
+    assert {p.name for p in out.iterdir()} == {"train.jsonl", "val.jsonl", "test.jsonl"}
+
+
+def test_all_rows_in_conflict_raises(tmp_path):
+    path = tmp_path / "allconflict.csv"
+    pd.DataFrame({"itemId": [1, 2], "reviewContent": ["barang oke", "Barang OKE!"],
+                  "rating": [5, 1], "sentiment_label": ["positive", "negative"]}
+                 ).to_csv(path, index=False)
+    with pytest.raises(ValueError, match="conflict"):
+        run(path, tmp_path / "out")
+    assert not (tmp_path / "out").exists()

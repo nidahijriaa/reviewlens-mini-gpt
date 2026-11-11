@@ -7,7 +7,9 @@ Contract: INTERFACES.md section 13 (and 4, 5, 7).
 Steps (all reused from src/reviewlens, nothing re-implemented here):
     preprocess.load_reviews   read CSV read-only, map columns in memory, drop empty/duplicates
     preprocess.clean_text     clean + normalise every review, drop reviews that become empty
-    preprocess.split_data     stratified on sentiment, 80/10/10, seed 42
+    preprocess.split_data_with_stats
+                              grouped by cleaned text, conflict groups dropped,
+                              stratified on sentiment, 80/10/10, seed 42
     labeling.label_review     silver insight label per review
     oversampling              negative reviews duplicated in the TRAIN split only
     write                     train.jsonl / val.jsonl / test.jsonl in --out-dir
@@ -36,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from reviewlens.config import Paths  # noqa: E402
 from reviewlens.dataset import MAX_REVIEW_TOKENS  # noqa: E402
 from reviewlens.labeling import label_review  # noqa: E402
-from reviewlens.preprocess import clean_text, load_reviews, split_data  # noqa: E402
+from reviewlens.preprocess import clean_text, load_reviews, split_data_with_stats  # noqa: E402
 
 #: Fields of every jsonl row (INTERFACES.md 7). ReviewInsightDataset requires
 #: review/positives/pain_points/suggestions; the rest is kept for analysis.
@@ -159,7 +161,13 @@ def prepare(
     if df.empty:
         raise ValueError(f"no usable reviews in {csv_path} after cleaning")
 
-    parts = dict(zip(SPLITS, split_data(df, val_frac=val_frac, test_frac=test_frac, seed=seed)))
+    *split_parts, split_stats = split_data_with_stats(
+        df, val_frac=val_frac, test_frac=test_frac, seed=seed
+    )
+    if split_stats["n_rows_kept"] == 0:
+        raise ValueError(f"no usable reviews in {csv_path}: every row is in a conflict group")
+    parts = dict(zip(SPLITS, split_parts))
+    kept = pd.concat(split_parts, ignore_index=True)
     records = {name: build_records(part) for name, part in parts.items()}
     split_sizes = {name: len(recs) for name, recs in records.items()}
     records["train"] = oversample_negatives(records["train"], neg_oversample, seed)
@@ -172,7 +180,7 @@ def prepare(
     # --- statistics -----------------------------------------------------
     texts = {name: {r["review"] for r in records[name]} for name in SPLITS}
     all_recs = [r for name in SPLITS for r in records[name]]
-    truncated = int((df["review"].str.split().str.len() > MAX_REVIEW_TOKENS).sum())
+    truncated = int((kept["review"].str.split().str.len() > MAX_REVIEW_TOKENS).sum())
     phrase_counts = {
         section: dict(Counter(p for r in all_recs for p in r[section]).most_common())
         for section in ("positives", "pain_points", "suggestions")
@@ -187,13 +195,15 @@ def prepare(
         "neg_oversample": neg_oversample,
         "n_loaded": n_loaded,
         "n_empty_after_clean": n_loaded - len(df),
-        "n_used": len(df),
+        "n_after_clean": len(df),                                     # split input, pre-conflict
+        "split_stats": split_stats,                                   # split_data_with_stats
+        "n_used": split_stats["n_rows_kept"],                         # rows in train/val/test
         "split_sizes": split_sizes,                                   # before oversampling
         "written_sizes": {name: len(records[name]) for name in SPLITS},
         "sentiment": {name: _distribution(records[name], "sentiment") for name in SPLITS},
         "aspect_phrases": phrase_counts,                               # incl. oversampled copies
-        "pct_review_truncated": 100.0 * truncated / len(df),           # > MAX_REVIEW_TOKENS words
-        "shared_review_texts": {                                       # identical text, other item
+        "pct_review_truncated": 100.0 * truncated / len(kept),         # > MAX_REVIEW_TOKENS words
+        "shared_review_texts": {                                       # expected 0 (grouped split)
             "train&val": len(texts["train"] & texts["val"]),
             "train&test": len(texts["train"] & texts["test"]),
             "val&test": len(texts["val"] & texts["test"]),
@@ -205,9 +215,22 @@ def _print_stats(stats: dict) -> None:
     print(f"CSV        : {stats['csv']}")
     print(f"Output dir : {stats['out_dir']}")
     print(f"Loaded {stats['n_loaded']} reviews, {stats['n_empty_after_clean']} empty after "
-          f"clean_text -> {stats['n_used']} used")
-    print(f"Split (seed={stats['seed']}, val={stats['val_frac']}, test={stats['test_frac']}): "
-          f"{stats['split_sizes']}")
+          f"clean_text -> {stats['n_after_clean']} enter the split (before conflict removal)")
+    ss = stats["split_stats"]
+    print(f"Grouped split (seed={stats['seed']}, val={stats['val_frac']}, "
+          f"test={stats['test_frac']}):")
+    print(f"  n_rows_input      : {ss['n_rows_input']}")
+    print(f"  n_groups          : {ss['n_groups']}")
+    print(f"  n_conflict_groups : {ss['n_conflict_groups']}")
+    print(f"  n_rows_dropped    : {ss['n_rows_dropped']}  (conflicting sentiment, removed)")
+    print(f"  n_rows_kept       : {ss['n_rows_kept']}  (used for train/val/test)")
+    print(f"  split_rows        : {ss['split_rows']}")
+    frac = ", ".join(f"{k} {v:.4f}" for k, v in ss["split_frac"].items())
+    print(f"  split_frac        : {frac}")
+    examples = ss["conflict_examples"]
+    print(f"  conflict_examples : {len(examples)} shown of {ss['n_conflict_groups']}")
+    for text in examples:
+        print(f"    - {text!r}")
     print(f"Written (train oversampled x{stats['neg_oversample']} negatives): "
           f"{stats['written_sizes']}")
     for name, dist in stats["sentiment"].items():
