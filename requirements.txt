@@ -1,0 +1,9 @@
+# ReviewLens GPT - dependency pihak ketiga yang benar-benar di-import oleh
+# src/, scripts/, tests/, dan notebooks/. Modul lain hanya pustaka standar Python.
+# Python 3.10+ (Kaggle sudah menyediakan semua paket ini).
+
+torch>=2.1         # model, training, inferensi (src/, tests/, notebooks/)
+numpy>=1.24        # split & oversampling (src/preprocess.py, scripts/), tests/, notebooks/
+pandas>=2.0        # baca/olah CSV (src/preprocess.py, scripts/), tests/, notebooks/
+matplotlib>=3.7    # kurva loss (notebooks/02_train_evaluate.ipynb)
+pytest>=7.0        # unit test (tests/)

@@ -416,3 +416,20 @@ Setelah itu semua bergabung di F4–F5.
 3. Ukuran model (≈ 4,7–5,8 juta parameter) dan hyperparameter awal (§8).
 4. Kaggle (GPU tunggal) untuk training utama, Colab sebagai cadangan, Streamlit lokal untuk demo (§9).
 5. `Processed Dataset.csv` sebagai satu-satunya sumber data pipeline.
+
+---
+
+## 14. Status Akhir dan Perubahan dari Rencana
+
+Status per 11 November 2026 (tahap F7). Rencana di §1–§13 di atas dipertahankan
+sebagai catatan desain awal; tabel berikut mencatat bagian yang dilaksanakan berbeda.
+
+| Rencana awal | Yang dilakukan | Alasan |
+|---|---|---|
+| Modul `train.py`, `inference.py`, `evaluate.py` di `src/reviewlens/` | Fungsi training, inferensi (generate + parsing), dan evaluasi ditulis di dalam `notebooks/02_train_evaluate.ipynb` | Training dijalankan sebagai notebook di GPU Kaggle |
+| Aplikasi Streamlit (`app/streamlit_app.py`) | Tidak dibuat; demo memakai Customer Insight Report di notebook 02 | Keterbatasan waktu |
+| Checkpoint di folder `checkpoints/` | Checkpoint disimpan per eksperimen di `runs/<nama_eksperimen>/` | Notebook menjalankan beberapa eksperimen sekaligus, sehingga tiap eksperimen perlu folder sendiri |
+| `tests/test_checkpoint.py` dan `tests/test_inference.py` | Tidak dibuat; pemeriksaan checkpoint dan parsing dilakukan di dalam notebook 02 | Kode checkpoint dan inferensi berada di notebook, bukan di modul yang bisa di-test |
+| Tenggat 9 November 2026 | Tenggat diperpanjang menjadi 11 November 2026; proyek dikerjakan tim 2 orang | Perpanjangan tenggat |
+
+Ringkasan hasil dan cara menjalankan proyek ada di [README.md](README.md).

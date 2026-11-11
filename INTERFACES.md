@@ -1,5 +1,10 @@
 # INTERFACES — Kontrak Antar-Modul ReviewLens GPT
 
+> **Catatan status akhir (11 November 2026):** kontrak §9 (`train.py`), §10 (`inference.py`),
+> §11 (`evaluate.py`), dan §12 (Streamlit) **tidak dibuat sebagai modul terpisah**. Fungsi
+> training, inferensi, dan evaluasi ada di `notebooks/02_train_evaluate.ipynb`, dan aplikasi
+> Streamlit tidak dibuat. Lihat PROJECT_CONTEXT.md §14.
+
 Status: **Revisi 2.1 — siap ditinjau untuk persetujuan tim.**
 Revisi 2.1: target padding memakai `IGNORE_INDEX = -100` dari `config.py`
 (bukan `PAD`); lihat §2.3, §3, §7, §8, §9, §11, §14.
